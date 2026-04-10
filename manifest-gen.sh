@@ -6,11 +6,13 @@
 #  Phase 2: HPA, Resource Limits, Probes (enhanced Deployment)
 #  Phase 3: StatefulSet, DaemonSet, ServiceAccount+RBAC, NetworkPolicy
 #=============================================================
+VERSION="1.1.0"
+AUTHOR="amirhoseinjafari1"
 
 set -euo pipefail
 
 # ──────────────── Constants ────────────────
-readonly VERSION="3.3"
+readonly VERSION="1.1.0"
 readonly LOG_FILE="/tmp/k8s-gen-$(date +%Y%m%d-%H%M%S).log"
 readonly SCRIPT_NAME="$(basename "$0")"
 
@@ -49,14 +51,17 @@ trap cleanup EXIT INT TERM
 
 # ──────────────── Banner ────────────────
 banner() {
-    echo -e "${CYAN}"
-    cat << 'EOF'
-╔══════════════════════════════════════════════════╗
-║       ☸  K8s Manifest Generator  v3.3  ☸        ║
-║          Phase 1-3 : Full Coverage              ║
-╚══════════════════════════════════════════════════╝
-EOF
-    echo -e "${NC}"
+  local _RESET="\033[0m"
+  local _BOLD="\033[1m"
+  local _CYAN="\033[36m"
+  local _MAGENTA="\033[35m"
+  local _YELLOW="\033[33m"
+  local _GRAY="\033[90m"
+
+  echo -e "${_GRAY}────────────────────────────────────${_RESET}"
+  echo -e "${_BOLD}${_CYAN}☸ K8s Manifest Generator${_RESET}  ${_YELLOW}v${VERSION}${_RESET}"
+  echo -e "${_MAGENTA}Author:${_RESET} ${AUTHOR} ${_GRAY}(github)${_RESET}"
+  echo -e "${_GRAY}────────────────────────────────────${_RESET}"
 }
 
 # ──────────────── Logging ────────────────
@@ -197,6 +202,32 @@ validate_memory() {
         return 1
     fi
 }
+get_resource_profile_defaults() {
+    local profile="$1"
+    local req_cpu req_mem lim_cpu lim_mem
+
+    case "$profile" in
+        1|low|Low)
+            req_cpu="50m";  lim_cpu="200m"
+            req_mem="64Mi"; lim_mem="128Mi"
+            ;;
+        2|medium|Medium)
+            req_cpu="100m"; lim_cpu="500m"
+            req_mem="128Mi"; lim_mem="256Mi"
+            ;;
+        3|high|High)
+            req_cpu="250m"; lim_cpu="1000m"
+            req_mem="256Mi"; lim_mem="512Mi"
+            ;;
+        *)
+            req_cpu="100m"; lim_cpu="500m"
+            req_mem="128Mi"; lim_mem="256Mi"
+            ;;
+    esac
+
+    echo "${req_cpu}|${req_mem}|${lim_cpu}|${lim_mem}"
+}
+
 
 validate_storage() {
     local s="$1"
@@ -645,12 +676,29 @@ generate_deployment_advanced() {
     replicas="${CLI_REPLICAS:-$(read_validated "Replicas" "3" validate_replicas)}"
     port="${CLI_PORT:-$(read_validated "Port" "80" validate_port)}"
 
-    echo -e "\n${BOLD}── Resource Limits ──${NC}" >&2
+
+    echo -e "\n${BOLD}── Resource Recommendation ──${NC}" >&2
+    local profile defaults
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    profile="2"
+    else
+    echo -e "  1) Low (dev/test)" >&2
+    echo -e "  2) Medium (typical app)" >&2
+    echo -e "  3) High (high traffic)" >&2
+    profile=$(read_input "Select profile (1-3)" "2")
+    fi
+    
+    defaults="$(get_resource_profile_defaults "$profile")"
+    IFS='|' read -r def_req_cpu def_req_mem def_lim_cpu def_lim_mem <<< "$defaults"
+    
+    echo -e "\n${BOLD}── Resource Limits (editable) ──${NC}" >&2
     local req_cpu req_mem lim_cpu lim_mem
-    req_cpu=$(read_validated "CPU request" "100m" validate_cpu)
-    req_mem=$(read_validated "Memory request" "128Mi" validate_memory)
-    lim_cpu=$(read_validated "CPU limit" "500m" validate_cpu)
-    lim_mem=$(read_validated "Memory limit" "256Mi" validate_memory)
+    req_cpu=$(read_validated "CPU request" "$def_req_cpu" validate_cpu)
+    req_mem=$(read_validated "Memory request" "$def_req_mem" validate_memory)
+    lim_cpu=$(read_validated "CPU limit" "$def_lim_cpu" validate_cpu)
+    lim_mem=$(read_validated "Memory limit" "$def_lim_mem" validate_memory)
+
+
 
     echo -e "\n${BOLD}── Health Probes ──${NC}" >&2
     local probe_path liveness_delay liveness_period readiness_delay readiness_period
@@ -994,7 +1042,7 @@ spec:
 }
 
 generate_full_stack() {
-    log_info "── Full Stack (Namespace + Deployment + Service) ──"
+    log_info "── Full Microservice Stack ──"
 
     local name namespace image replicas port
     name="${CLI_NAME:-$(read_validated "App name" "myapp" validate_k8s_name)}"
@@ -1003,6 +1051,75 @@ generate_full_stack() {
     replicas="${CLI_REPLICAS:-$(read_validated "Replicas" "3" validate_replicas)}"
     port="${CLI_PORT:-$(read_validated "Port" "80" validate_port)}"
 
+    local profile defaults req_cpu req_mem lim_cpu lim_mem
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        profile="2"
+    else
+        echo -e "  1) Low   2) Medium   3) High" >&2
+        profile=$(read_input "Resource profile (1-3)" "2")
+    fi
+    defaults="$(get_resource_profile_defaults "$profile")"
+    IFS='|' read -r def_req_cpu def_req_mem def_lim_cpu def_lim_mem <<< "$defaults"
+
+    req_cpu=$(read_validated "CPU request" "$def_req_cpu" validate_cpu)
+    req_mem=$(read_validated "Memory request" "$def_req_mem" validate_memory)
+    lim_cpu=$(read_validated "CPU limit" "$def_lim_cpu" validate_cpu)
+    lim_mem=$(read_validated "Memory limit" "$def_lim_mem" validate_memory)
+
+    local enable_hpa min_rep max_rep cpu_pct hpa_block=""
+    enable_hpa=$(read_yes_no "Enable HPA?" "n")
+    if [[ "$enable_hpa" == "y" || "$enable_hpa" == "Y" ]]; then
+        min_rep=$(read_validated "HPA min replicas" "2" validate_replicas)
+        max_rep=$(read_validated "HPA max replicas" "10" validate_replicas)
+        cpu_pct=$(read_validated "HPA target CPU %" "80" validate_percentage)
+
+        hpa_block="---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ${name}-hpa
+  namespace: ${namespace}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${name}
+  minReplicas: ${min_rep}
+  maxReplicas: ${max_rep}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: ${cpu_pct}"
+    fi
+
+    local host ingress_class ingress_block=""
+    host=$(read_input "Ingress host (empty=disable ingress)" "")
+    if [[ -n "$host" ]]; then
+        ingress_class=$(read_input "IngressClassName" "nginx")
+        ingress_block="---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${name}-ing
+  namespace: ${namespace}
+spec:
+  ingressClassName: ${ingress_class}
+  rules:
+    - host: ${host}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ${name}-svc
+                port:
+                  number: ${port}"
+    fi
+
     local out="${OUTPUT_DIR}/${name}-full-stack.yaml"
     [[ "$NON_INTERACTIVE" != "true" ]] && out=$(read_input "Output file" "$out")
 
@@ -1010,6 +1127,30 @@ generate_full_stack() {
 kind: Namespace
 metadata:
   name: ${namespace}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${name}-sa
+  namespace: ${namespace}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${name}-config
+  namespace: ${namespace}
+data:
+  APP_NAME: ${name}
+  APP_ENV: production
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${name}-secret
+  namespace: ${namespace}
+type: Opaque
+stringData:
+  APP_SECRET: change-me
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1026,11 +1167,36 @@ spec:
       labels:
         app: ${name}
     spec:
+      serviceAccountName: ${name}-sa
       containers:
         - name: ${name}
           image: ${image}
           ports:
             - containerPort: ${port}
+          envFrom:
+            - configMapRef:
+                name: ${name}-config
+            - secretRef:
+                name: ${name}-secret
+          resources:
+            requests:
+              cpu: ${req_cpu}
+              memory: ${req_mem}
+            limits:
+              cpu: ${lim_cpu}
+              memory: ${lim_mem}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ${port}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ${port}
+            initialDelaySeconds: 5
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -1043,7 +1209,25 @@ spec:
   ports:
     - port: ${port}
       targetPort: ${port}
-  type: ClusterIP"
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${name}-allow-svc-port
+  namespace: ${namespace}
+spec:
+  podSelector:
+    matchLabels:
+      app: ${name}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: ${port}
+${hpa_block}
+${ingress_block}"
 }
 
 # ══════════════════════════════════════════════════
